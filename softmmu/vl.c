@@ -211,6 +211,7 @@ static struct {
     { .driver = "cirrus-vga",           .flag = &default_vga       },
     { .driver = "isa-cirrus-vga",       .flag = &default_vga       },
     { .driver = "vmware-svga",          .flag = &default_vga       },
+    { .driver = "vmware-svga-vulkan",        .flag = &default_vga       },
     { .driver = "qxl-vga",              .flag = &default_vga       },
     { .driver = "virtio-vga",           .flag = &default_vga       },
     { .driver = "ati-vga",              .flag = &default_vga       },
@@ -914,6 +915,11 @@ static const VGAInterfaceInfo vga_interfaces[VGA_TYPE_MAX] = {
         .opt_name = "vmware",
         .name = "VMWare SVGA",
         .class_names = { "vmware-svga" },
+    },
+    [VGA_VMWARE_VULKAN] = {
+        .opt_name = "vulkan-vmware",
+        .name = "VMWare SVGA (Vulkan)",
+        .class_names = { "vmware-svga-vulkan" },
     },
     [VGA_VIRTIO] = {
         .opt_name = "virtio",

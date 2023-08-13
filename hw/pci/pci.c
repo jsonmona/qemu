@@ -1939,6 +1939,8 @@ PCIDevice *pci_vga_init(PCIBus *bus)
         return pci_create_simple(bus, -1, "VGA");
     case VGA_VMWARE:
         return pci_create_simple(bus, -1, "vmware-svga");
+    case VGA_VMWARE_VULKAN:
+        return pci_create_simple(bus, -1, "vmware-svga-vulkan");
     case VGA_VIRTIO:
         return pci_create_simple(bus, -1, "virtio-vga");
     case VGA_NONE:

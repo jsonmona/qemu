@@ -3668,7 +3668,10 @@ if emulator_modules.length() > 0
   alias_target('modules', emulator_modules)
 endif
 
-system_ss.add(authz, blockdev, chardev, crypto, io, qmp)
+# Build little rust program (TODO: should be optional)
+subdir('vmware-svga-vulkan-impl')
+
+system_ss.add(authz, blockdev, chardev, crypto, io, qmp, vmsvga_vulkan_impl)
 common_ss.add(qom, qemuutil)
 
 common_ss.add_all(when: 'CONFIG_SYSTEM_ONLY', if_true: [system_ss])

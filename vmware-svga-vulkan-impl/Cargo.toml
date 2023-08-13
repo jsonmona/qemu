@@ -1,0 +1,29 @@
+[package]
+name = "vmware-svga-vulkan-impl"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+# Unwind puts qemu in weird state, locking up mouse with gdb
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+ash = "0.37.3"
+bytemuck = { version = "1.13.1", features = ["extern_crate_std", "derive"] }
+crossbeam = "0.8.2"
+log = { version = "0.4.20", features = ["std"] }
+parking_lot = "0.12.1"
+pretty_env_logger = "0.5.0"
+wide = "0.7.11"
+
+[build-dependencies]
+cbindgen = "0.24.5"
+
+[dev-dependencies]
+bindgen = "0.66.1"
