@@ -14,12 +14,14 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-ash = "0.37.3"
+anyhow = { version = "1.0.72", features = ["backtrace"] }
 bytemuck = { version = "1.13.1", features = ["extern_crate_std", "derive"] }
 crossbeam = "0.8.2"
 log = { version = "0.4.20", features = ["std"] }
 parking_lot = "0.12.1"
+pollster = "0.3.0"
 pretty_env_logger = "0.5.0"
+wgpu = "0.17.0"
 wide = "0.7.11"
 
 [build-dependencies]

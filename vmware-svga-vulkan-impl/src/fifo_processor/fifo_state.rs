@@ -7,6 +7,7 @@ use log::{trace, warn};
 use parking_lot::{Condvar, Mutex};
 
 use crate::ffi::chip_config::ChipConfig;
+use crate::graphic::GraphicState;
 use crate::mailbox::Mailbox;
 use crate::shared_mem::SharedMem;
 
@@ -29,10 +30,6 @@ pub struct FifoState {
 
     output: Arc<Mailbox>,
 }
-
-struct MovablePtr(*mut u8);
-unsafe impl Send for MovablePtr {}
-unsafe impl Sync for MovablePtr {}
 
 impl FifoState {
     pub fn new(config: &ChipConfig) -> Self {
@@ -94,8 +91,10 @@ impl FifoState {
         let mut suspend = || self.suspend();
         let mut fifo = FifoReader::new(self.fifo.clone(), &mut suspend);
 
+        let mut graphic = pollster::block_on(GraphicState::new(width, height));
+
         while self.enabled.load(Acquire) {
-            self.render_output(width, height);
+            self.render_output(width, height, &mut graphic);
 
             let cmd = match fetch_fifo_cmd(&mut fifo) {
                 Some(x) => x,
@@ -105,13 +104,12 @@ impl FifoState {
             };
 
             //println!("{:?}", cmd);
-            cmd.process(self);
+            cmd.process(self, &mut graphic);
         }
     }
 
-    fn render_output(&self, width: u32, height: u32) {
+    fn render_output(&self, width: u32, height: u32, grpahic: &mut GraphicState) {
         let output_pixels = (width as usize) * (height as usize);
-        let output_bytes = output_pixels * 4;
 
         if output_pixels == 0 {
             return;
@@ -122,12 +120,10 @@ impl FifoState {
             *img = Some(vec![0; output_pixels]);
         }
 
-        let dst = img.as_mut().expect("checked").as_mut_ptr() as *mut u8;
-        let src = self.fb.as_byte_ptr() as *const u8;
+        let dst = img.as_mut().expect("checked").as_mut_slice();
+        let dst_bytes = bytemuck::cast_slice_mut(dst);
 
-        unsafe {
-            dst.copy_from_nonoverlapping(src, output_bytes);
-        }
+        pollster::block_on(grpahic.render(dst_bytes));
     }
 
     // Returns true if needs to terminate

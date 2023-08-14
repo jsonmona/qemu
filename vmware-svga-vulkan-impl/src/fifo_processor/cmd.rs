@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::ref_or_box::RefOrBox;
+use crate::{graphic::GraphicState, ref_or_box::RefOrBox};
 
 use super::{fifo_reader::FifoReader, fifo_state::FifoState};
 
@@ -30,7 +30,7 @@ pub trait FifoCmdInfo {
 
 pub trait FifoCmd: Debug + FifoCmdInfo {
     /** Process this command */
-    fn process(&self, state: &FifoState);
+    fn process(&self, state: &FifoState, graphic: &mut GraphicState);
 }
 
 impl<T: FifoCmdBuildable> FifoCmdInfo for T {
@@ -63,9 +63,11 @@ impl FifoCmdBuildable for FifoCmdUpdate {
 }
 
 impl FifoCmd for FifoCmdUpdate {
-    fn process(&self, _state: &FifoState) {
-        // Do nothing
-        //TODO: Mark the region as dirty
+    fn process(&self, state: &FifoState, graphic: &mut GraphicState) {
+        // TODO: Delay and do partial update
+        let pixels = graphic.width() * graphic.height();
+        let data = state.fb.slice_to(0, pixels as usize);
+        graphic.cmd_update_framebuffer_whole(data);
     }
 }
 
@@ -96,7 +98,7 @@ macro_rules! unimplemented_fifo_cmd {
             }
         }
         impl FifoCmd for $type_name {
-            fn process(&self, _state: &FifoState) {
+            fn process(&self, _state: &FifoState, _graphic: &mut GraphicState) {
                 println!("STUB: {}", Self::NAME);
             }
         }
