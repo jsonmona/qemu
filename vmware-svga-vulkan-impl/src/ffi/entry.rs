@@ -15,6 +15,15 @@ fn lock_ptr(p: Option<&vmsvga_vk_impl>) -> impl DerefMut<Target = Chip> + '_ {
     p.expect("Got null pointer through FFI").0.lock()
 }
 
+fn try_init_logger() {
+    let logger = pretty_env_logger::formatted_builder()
+        .filter(Some("wgpu"), log::LevelFilter::Warn)
+        .build();
+
+    // It's fine if logger is already set
+    let _ = log::set_boxed_logger(Box::new(logger));
+}
+
 // ===== Instance create & destroy =====
 
 /**
@@ -26,8 +35,7 @@ Size mismatch won't cause memory unsoundness.
  */
 #[no_mangle]
 pub unsafe extern "C" fn vmsvga_vk_config_default(config_size: usize, config: *mut ChipConfig) {
-    // Ignore error
-    let _ = pretty_env_logger::try_init();
+    try_init_logger();
 
     //TODO: Should return an error instead of aborting
     assert_eq!(config_size, size_of::<ChipConfig>(), "Invalid size");
@@ -46,8 +54,7 @@ pub unsafe extern "C" fn vmsvga_vk_config_default(config_size: usize, config: *m
 
 #[no_mangle]
 pub extern "C" fn vmsvga_vk_new(config: &ChipConfig) -> Box<vmsvga_vk_impl> {
-    // Ignore error
-    let _ = pretty_env_logger::try_init();
+    try_init_logger();
 
     Box::new(vmsvga_vk_impl(Mutex::new(Chip::new(config))))
 }
