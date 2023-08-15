@@ -25,9 +25,9 @@ pub struct FifoState {
     pub fb: SharedMem<u32>,
     pub enabled: AtomicBool,
     pub busy: AtomicBool,
-    pub resume: Condvar,
-    pub resume_mutex: Mutex<()>,
 
+    resume: Condvar,
+    resume_mutex: Mutex<()>,
     output: Arc<Mailbox>,
 }
 
@@ -106,6 +106,10 @@ impl FifoState {
             //println!("{:?}", cmd);
             cmd.process(self, &mut graphic);
         }
+    }
+
+    pub fn resume(&self) {
+        self.resume.notify_all();
     }
 
     fn render_output(&self, width: u32, height: u32, grpahic: &mut GraphicState) {

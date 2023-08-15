@@ -136,7 +136,7 @@ impl Chip {
 
         // Already enabled. Check if thread is running.
         if let Some(x) = self.fifo_thread.as_ref() {
-            self.fifo_state.resume.notify_all();
+            self.fifo_state.resume();
 
             if x.is_finished() {
                 if let Some(x) = self.fifo_thread.take() {
