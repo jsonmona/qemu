@@ -1,5 +1,7 @@
-use crate::shared_mem::SharedMem;
-use std::{ptr::slice_from_raw_parts, sync::atomic::Ordering::*};
+use bytemuck::Zeroable;
+
+use crate::{shared_mem::SharedMem, ref_or_box::RefOrBox};
+use std::sync::atomic::Ordering::*;
 
 // What a bad place to put constants :P
 // (and now duplicated over places!)
@@ -17,196 +19,167 @@ touch host-owned portion of memory.
 
 That allows us to treat those two variables as mutex into FIFO commands.
  */
-pub struct FifoReader<'cb> {
+pub struct FifoReader {
     mem: SharedMem<u32>,
 
-    /** terminate on getting true */
-    suspend: &'cb mut dyn FnMut() -> bool,
-
-    /** Borrowed commands but did not advance STOP by this amount */
-    borrowed_cmds: u32,
-
-    buffer: Box<[u32; 1024]>,
-
     // As far as I understand, these won't be touched after configured
-    min: u32,
-    max: u32,
+    min_byte: u32,
+    max_byte: u32,
     fifo_bytes: u32,
+    min_idx: u32,
+    max_idx: u32,
+    fifo_len: u32,
 }
 
-impl FifoReader<'_> {
-    pub fn new(mem: SharedMem<u32>, suspend: &mut dyn FnMut() -> bool) -> FifoReader<'_> {
-        let min = mem.at(SVGA_FIFO_MIN as usize).load(Relaxed);
-        let max = mem.at(SVGA_FIFO_MAX as usize).load(Relaxed);
-        assert!(min < max, "inverted range");
+impl FifoReader {
+    pub fn new(mem: SharedMem<u32>) -> FifoReader {
+        let min = mem.at(SVGA_FIFO_MIN as usize).load(Acquire);
+        let max = mem.at(SVGA_FIFO_MAX as usize).load(Acquire);
 
-        let fifo_bytes = max - min;
-        assert_eq!(fifo_bytes % 4, 0, "fifo size not divisable by 4");
+        assert!(min < max, "inverted range");
+        assert_eq!(min % 4, 0, "FIFO bounds not divisable by 4");
+        assert_eq!(max % 4, 0, "FIFO bounds not divisable by 4");
 
         FifoReader {
             mem,
-            suspend,
-            borrowed_cmds: 0,
-            buffer: bytemuck::zeroed_box(),
-            min,
-            max,
-            fifo_bytes,
+            min_byte: min,
+            max_byte: max,
+            fifo_bytes: max - min,
+            min_idx: min / 4,
+            max_idx: max / 4,
+            fifo_len: (max - min) / 4,
         }
     }
 
-    pub fn available(&self) -> usize {
-        let stop = self.mem.at(SVGA_FIFO_STOP as usize).load(Relaxed);
-        let next_cmd = self.mem.at(SVGA_FIFO_NEXT_CMD as usize).load(Relaxed);
+    /** Returns (available, stop) */
+    fn available(&self) -> (u32, u32) {
+        let stop = self.mem.at(SVGA_FIFO_STOP as usize).load(Acquire);
+        let next_cmd = self.mem.at(SVGA_FIFO_NEXT_CMD as usize).load(Acquire);
 
         assert!(
-            self.min <= stop && self.min <= next_cmd && stop < self.max && next_cmd < self.max,
+            self.min_byte <= stop && self.min_byte <= next_cmd && stop < self.max_byte && next_cmd < self.max_byte,
             "invalid head or tail"
         );
 
-        match stop.cmp(&next_cmd) {
-            std::cmp::Ordering::Less => (next_cmd - stop - self.borrowed_cmds) as usize / 4,
+        let available = match u32::cmp(&stop, &next_cmd) {
+            std::cmp::Ordering::Less => (next_cmd - stop) / 4,
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => {
-                (((self.max - stop) + (next_cmd - self.min)) / 4 - self.borrowed_cmds) as usize
+                ((self.max_byte - stop) + (next_cmd - self.min_byte)) / 4
             }
-        }
+        };
+
+        (available, stop)
     }
 
-    /** returns None if needs to terminate */
-    pub fn borrow(&mut self, cmds: usize) -> Option<&[u32]> {
-        while self.available() < cmds {
-            (self.suspend)();
-        }
+    pub fn view(&mut self) -> FifoView<'_> {
+        let (available, stop) = self.available();
 
-        Some(
-            self.try_borrow(cmds)
-                .expect("checked for remaining commands"),
-        )
-    }
-
-    /** returns None if not enough data is available (does not block) */
-    pub fn try_borrow(&mut self, cmds: usize) -> Option<&[u32]> {
-        assert!(cmds < self.buffer.len(), "borrow request too large");
-
-        let cmds = cmds as u32;
-
-        let stop = self.cleanup_borrow();
-        let next_cmd = self.mem.at(SVGA_FIFO_NEXT_CMD as usize).load(Acquire);
-
-        if stop == next_cmd {
-            return None;
-        }
-
-        let effective_end = if stop <= next_cmd { next_cmd } else { self.max };
-
-        if stop + cmds * 4 <= effective_end {
-            // Fast path. Return slice directly
-            self.borrowed_cmds = cmds;
-            return Some(self.make_fifo_slice(&self.mem, stop, cmds));
-        }
-
-        let wrap_remain = stop + cmds * 4 - effective_end;
-        if next_cmd < stop && wrap_remain + self.min <= next_cmd {
-            // Slow path. Copy into buffer with two memcpy
-            let mid_cmd = cmds - wrap_remain / 4;
-            debug_assert_eq!(wrap_remain / 4 + mid_cmd, cmds);
-
-            let first_src = self.make_fifo_slice(&self.mem, stop, mid_cmd);
-            let second_src = self.make_fifo_slice(&self.mem, self.min, wrap_remain / 4);
-
-            let (first, remain) = self.buffer.split_at_mut(mid_cmd as usize);
-            let (second, _) = remain.split_at_mut(wrap_remain as usize / 4);
-
-            first.copy_from_slice(first_src);
-            second.copy_from_slice(second_src);
-
-            self.advance(cmds);
-            return Some(&self.buffer[..cmds as usize]);
-        }
-
-        // Not enough data
-        None
-    }
-
-    /** STOP and NEXT_CMD must be acquired before calling this function */
-    fn make_fifo_slice<'a>(&self, mem: &'a SharedMem<u32>, from_byte: u32, cmds: u32) -> &'a [u32] {
-        assert_eq!(
-            &self.mem as *const _, mem as *const _,
-            "call this function with self.mem"
-        );
-        assert!(from_byte < self.max, "buffer overflow");
-
-        unsafe {
-            let p = mem.as_byte_ptr().add(from_byte as usize);
-            &*slice_from_raw_parts(p as *mut u32, cmds as usize)
+        FifoView {
+            parent: self,
+            peeked_amount: 0,
+            available,
+            cmd_pos: stop / 4,
         }
     }
 
     /** returns STOP value, loaded with acquire ordering */
-    fn cleanup_borrow(&mut self) -> u32 {
-        if self.borrowed_cmds != 0 {
-            let stop = self.advance(self.borrowed_cmds);
-            self.borrowed_cmds = 0;
-            stop
-        } else {
-            self.mem.at(SVGA_FIFO_STOP as usize).load(Acquire)
-        }
-    }
-
-    /** returns STOP value, loaded with acquire ordering */
-    fn advance(&mut self, amount: u32) -> u32 {
+    fn advance(&self, amount: u32) -> u32 {
         let stop = self.mem.at(SVGA_FIFO_STOP as usize);
 
         let mut old_pos = stop.load(Acquire);
         loop {
-            let new_pos = (old_pos + amount * 4 - self.min) % self.fifo_bytes + self.min;
+            let new_pos = (old_pos + amount * 4 - self.min_byte) % self.fifo_bytes + self.min_byte;
             match stop.compare_exchange_weak(old_pos, new_pos, Release, Acquire) {
                 Ok(_) => return new_pos,
                 Err(x) => old_pos = x,
             }
         }
     }
+}
 
-    /** Returns None if need to terminate */
+pub struct FifoView<'fifo> {
+    parent: &'fifo FifoReader,
+    peeked_amount: u32,
+    available: u32,
+    cmd_pos: u32,
+}
+
+impl<'fifo> FifoView<'fifo> {
+    /** Commit and consume viewed data */
+    pub fn commit(self) {
+        self.parent.advance(self.peeked_amount);
+    }
+
+    pub fn available(&self) -> u32 {
+        self.available - self.peeked_amount
+    }
+
     pub fn next(&mut self) -> Option<u32> {
-        //FIXME: Quite inefficient on weakly ordered CPU
-
-        let mut old_pos = self.cleanup_borrow();
-        let stop = self.mem.at(SVGA_FIFO_STOP as usize);
-
-        loop {
-            let next_cmd = self.mem.at(SVGA_FIFO_NEXT_CMD as usize).load(Acquire);
-
-            if old_pos == next_cmd {
-                if (self.suspend)() {
-                    return None;
-                }
-                continue;
-            }
-
-            let cmd = self.mem.at(old_pos as usize / 4).load(Relaxed);
-            let new_pos = (old_pos + 4 - self.min) % self.fifo_bytes + self.min;
-            match stop.compare_exchange_weak(old_pos, new_pos, Release, Acquire) {
-                Ok(_) => return Some(cmd),
-                Err(x) => old_pos = x,
-            }
+        if self.peeked_amount + 1 <= self.available {
+            let x = self.parent.mem.read_volatile(self.cmd_pos as usize);
+            self.advance(1);
+            Some(x)
+        } else {
+            None
         }
     }
+
+    pub fn borrow(&mut self, amount: u32) -> Option<RefOrBox<'fifo, [u32]>> {
+        if self.available < self.peeked_amount + amount {
+            return None;
+        }
+
+        let dist_to_max = self.parent.max_idx - self.cmd_pos;
+        if amount <= dist_to_max {
+            // Fast path. Return slice directly
+            let data = self.parent.mem.slice_to(self.cmd_pos as usize, (self.cmd_pos + amount) as usize);
+            
+            self.advance(amount);
+            Some(RefOrBox::Refed(data))
+        } else {
+            // Slow path. Copy to box with two memcpy
+            let mut data = alloc_box_slice(amount as usize);
+
+            let first_half = self.parent.mem.slice_to(self.cmd_pos as usize, (self.cmd_pos + dist_to_max) as usize);
+            (&mut data[..(dist_to_max as usize)]).copy_from_slice(first_half);
+
+            let second_half_len = amount - dist_to_max;
+            let second_half = self.parent.mem.slice_to(self.parent.min_idx as usize, (self.parent.min_idx + second_half_len) as usize);
+            (&mut data[(dist_to_max as usize)..]).copy_from_slice(second_half);
+
+            self.advance(amount);
+            Some(RefOrBox::Boxed(data))
+        }
+    }
+
+    fn advance(&mut self, amount: u32) {
+        self.peeked_amount += amount;
+        self.cmd_pos += amount;
+        while self.parent.max_idx <= self.cmd_pos {
+            self.cmd_pos -= self.parent.fifo_len;
+        }
+    }
+}
+
+fn alloc_box_slice<T: Copy + Zeroable>(len: usize) -> Box<[T]> {
+    if len == 0 {
+        return Default::default();
+    }
+    let layout = std::alloc::Layout::array::<T>(len).unwrap();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut T };
+    let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
+    unsafe { Box::from_raw(slice_ptr) }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
-    fn suspend() -> bool {
-        false
-    }
-
-    fn setup<'cb>(
+    fn setup(
         arr: &mut [u32; 10],
-        cmds: u32,
-        suspend_fn: &'cb mut dyn FnMut() -> bool,
-    ) -> FifoReader<'cb> {
+        cmds: u32
+    ) -> FifoReader {
         arr[0] = 4 * 4; // MIN
         arr[1] = 10 * 4; // MAX
         arr[2] = (4 + cmds) * 4; // NEXT_CMD
@@ -223,86 +196,117 @@ mod test {
 
         let mem = SharedMem::<u32>::new(arr.as_mut_ptr() as *mut u8, arr.len() * 4);
 
-        FifoReader::new(mem, suspend_fn)
+        FifoReader::new(mem)
     }
 
     #[test]
     fn basic_iter() {
-        let suspend = &mut suspend;
         let mut arr = [0; 10];
-        let mut reader = setup(&mut arr, 5, suspend);
+        let mut reader = setup(&mut arr, 5);
 
-        assert_eq!(reader.available(), 5);
-        assert_eq!(reader.next(), Some(1));
-        assert_eq!(reader.next(), Some(2));
-        assert_eq!(reader.next(), Some(3));
-        assert_eq!(reader.next(), Some(4));
-        assert_eq!(reader.next(), Some(5));
-        assert_eq!(reader.available(), 0);
+        assert_eq!(reader.available().0, 5);
+        let mut view = reader.view();
+        assert_eq!(view.next(), Some(1));
+        assert_eq!(view.next(), Some(2));
+        assert_eq!(view.next(), Some(3));
+        view.commit();
+
+        assert_eq!(reader.available().0, 2);
+        let mut view = reader.view();
+        assert_eq!(view.next(), Some(4));
+        assert_eq!(view.next(), Some(5));
+        assert_eq!(view.next(), None);
+        // Does not commit
+
+        assert_eq!(reader.available().0, 2);
+        let mut view = reader.view();
+        assert_eq!(view.next(), Some(4));
+        assert_eq!(view.next(), Some(5));
+        assert_eq!(view.next(), None);
+        view.commit();
+
+        assert_eq!(reader.available().0, 0);
     }
 
     #[test]
     fn wrapping_iter() {
-        let suspend = &mut suspend;
         let mut arr = [0; 10];
-        let mut reader = setup(&mut arr, 7, suspend);
+        let mut reader = setup(&mut arr, 7);
 
         arr[3] += 8; // Advance 2 commands
 
-        assert_eq!(reader.available(), 5);
-        assert_eq!(reader.next(), Some(3));
+        assert_eq!(reader.available().0, 5);
+        let mut view = reader.view();
+        assert_eq!(view.next(), Some(3));
+        assert_eq!(view.next(), Some(4));
+        assert_eq!(view.next(), Some(5));
+        view.commit();
 
-        assert_eq!(reader.available(), 4);
-        assert_eq!(reader.next(), Some(4));
+        assert_eq!(reader.available().0, 2);
+        let mut view = reader.view();
+        assert_eq!(view.next(), Some(6));
+        assert_eq!(view.next(), Some(1));
+        assert_eq!(view.next(), None);
+        // Does not commit
 
-        assert_eq!(reader.available(), 3);
-        assert_eq!(reader.next(), Some(5));
+        assert_eq!(reader.available().0, 2);
+        let mut view = reader.view();
+        assert_eq!(view.next(), Some(6));
+        assert_eq!(view.next(), Some(1));
+        assert_eq!(view.next(), None);
+        view.commit();
 
-        assert_eq!(reader.available(), 2);
-        assert_eq!(reader.next(), Some(6));
-
-        assert_eq!(reader.available(), 1);
-        assert_eq!(reader.next(), Some(1));
-
-        assert_eq!(reader.available(), 0);
+        assert_eq!(reader.available().0, 0);
     }
 
     #[test]
     fn basic_slice() {
-        let suspend = &mut suspend;
         let mut arr = [0; 10];
-        let mut reader = setup(&mut arr, 5, suspend);
+        let mut reader = setup(&mut arr, 5);
 
-        assert_eq!(reader.try_borrow(6), None);
-        assert_eq!(reader.try_borrow(3), Some([1, 2, 3].as_slice()));
-        assert_eq!(reader.try_borrow(2), Some([4, 5].as_slice()));
-        assert_eq!(reader.try_borrow(2), None);
-        assert_eq!(reader.try_borrow(1), None);
+        let mut view = reader.view();
+        assert_eq!(view.borrow(6), None);
+        assert_eq!(view.borrow(3), Some(RefOrBox::Refed([1, 2, 3].as_slice())));
+        view.commit();
+
+        let mut view = reader.view();
+        assert_eq!(view.borrow(2), Some(RefOrBox::Refed([4, 5].as_slice())));
+        assert_eq!(view.borrow(2), None);
     }
 
     #[test]
     fn wrapping_slice() {
-        let suspend = &mut suspend;
         let mut arr = [0; 10];
-        let mut reader = setup(&mut arr, 7, suspend);
+        let mut reader = setup(&mut arr, 7);
 
         arr[3] += 8; // Advance 2 commands
 
-        assert_eq!(reader.try_borrow(6), None);
-        assert_eq!(reader.try_borrow(2), Some([3, 4].as_slice()));
-        assert_eq!(reader.try_borrow(3), Some([5, 6, 1].as_slice()));
-        assert_eq!(reader.try_borrow(1), None);
-        assert_eq!(reader.try_borrow(2), None);
+        let mut view = reader.view();
+        assert_eq!(view.borrow(6), None);
+        assert_eq!(view.borrow(2), Some(RefOrBox::Refed([3, 4].as_slice())));
+        view.commit();
+
+        let mut view = reader.view();
+        assert_eq!(view.borrow(3), Some(RefOrBox::Refed([5, 6, 1].as_slice())));
+        assert_eq!(view.borrow(2), None);
+        view.commit();
+
+        let view = reader.view();
+        assert_eq!(view.available(), 0);
 
         // 2nd test
-        reader = setup(&mut arr, 7, suspend);
+        reader = setup(&mut arr, 7);
 
         arr[3] += 8; // Advance 2 commands
 
-        assert_eq!(reader.try_borrow(6), None);
-        assert_eq!(reader.try_borrow(4), Some([3, 4, 5, 6].as_slice()));
-        assert_eq!(reader.try_borrow(1), Some([1].as_slice()));
-        assert_eq!(reader.try_borrow(1), None);
-        assert_eq!(reader.try_borrow(2), None);
+        let mut view = reader.view();
+        assert_eq!(view.borrow(6), None);
+        assert_eq!(view.borrow(4), Some(RefOrBox::Refed([3, 4, 5, 6].as_slice())));
+        view.commit();
+
+        let mut view = reader.view();
+        assert_eq!(view.borrow(1), Some(RefOrBox::Refed([1].as_slice())));
+        assert_eq!(view.borrow(1), None);
+        view.commit();
     }
 }

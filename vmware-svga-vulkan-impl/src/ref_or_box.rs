@@ -34,6 +34,16 @@ impl<'a, T: ?Sized> RefOrBox<'a, T> {
     }
 }
 
+impl<'a, T: ?Sized + PartialEq> PartialEq for RefOrBox<'a, T> {
+    fn eq(&self, other: &Self) -> bool {
+        T::eq(self.deref(), other.deref())
+    }
+
+    fn ne(&self, other: &Self) -> bool {
+        T::ne(self.deref(), other.deref())
+    }
+}
+
 impl<'a, T: ?Sized> Deref for RefOrBox<'a, T> {
     type Target = T;
 

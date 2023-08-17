@@ -1,10 +1,10 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, ops::Deref};
 
 use bytemuck::{Pod, Zeroable};
 
 use crate::{graphic::GraphicState, ref_or_box::RefOrBox};
 
-use super::{fifo_reader::FifoReader, fifo_state::FifoState};
+use super::{fifo_reader::FifoView, fifo_state::FifoState};
 
 pub trait FifoCmdBuildable: Clone {
     /** Opcode of this command */
@@ -17,7 +17,7 @@ pub trait FifoCmdBuildable: Clone {
     const NAME: &'static str;
 
     /** Make an instance of this command from fifo stream */
-    fn from_fifo<'a>(fifo: &'a mut FifoReader) -> Option<RefOrBox<'a, dyn FifoCmd>>;
+    fn from_fifo<'a>(view: &'a mut FifoView) -> Option<RefOrBox<'a, dyn FifoCmd>>;
 }
 
 pub trait FifoCmdInfo {
@@ -56,9 +56,16 @@ impl FifoCmdBuildable for FifoCmdUpdate {
     const ARGS: Option<u32> = Some(4);
     const NAME: &'static str = "SVGA_CMD_UPDATE";
 
-    fn from_fifo<'a>(fifo: &'a mut FifoReader) -> Option<RefOrBox<'a, dyn FifoCmd>> {
-        let cmd = bytemuck::cast_slice(fifo.borrow(4)?);
-        Some(RefOrBox::from_ref(bytemuck::from_bytes::<Self>(cmd)))
+    fn from_fifo<'a>(view: &'a mut FifoView) -> Option<RefOrBox<'a, dyn FifoCmd>> {
+        Some(match view.borrow(4)? {
+            RefOrBox::Refed(x) => RefOrBox::from_ref(bytemuck::from_bytes::<Self>(bytemuck::cast_slice(x))),
+            RefOrBox::Boxed(x) => {
+                //FIXME: Is this even remotely safe?
+                let q: Box<[FifoCmdUpdate]> = bytemuck::cast_slice_box(x);
+                let c: Box<FifoCmdUpdate> = unsafe { Box::from_raw(Box::into_raw(q) as *mut FifoCmdUpdate) };
+                RefOrBox::from_box(c)
+            }
+        })
     }
 }
 
@@ -90,9 +97,9 @@ macro_rules! unimplemented_fifo_cmd {
             const OPCODE: u32 = $opcode;
             const ARGS: Option<u32> = Some($args);
             const NAME: &'static str = stringify!($name);
-            fn from_fifo<'a>(fifo: &'a mut FifoReader) -> Option<RefOrBox<'a, dyn FifoCmd>> {
+            fn from_fifo<'a>(view: &'a mut FifoView) -> Option<RefOrBox<'a, dyn FifoCmd>> {
                 for _ in 0..$args {
-                    fifo.next()?;
+                    view.next()?;
                 }
                 Some(Box::new($type_name).into())
             }
@@ -107,14 +114,14 @@ macro_rules! unimplemented_fifo_cmd {
 
 unimplemented_fifo_cmd! { FifoCmdFence, SVGA_CMD_FENCE, 30, 1 }
 
-pub fn fetch_fifo_cmd<'a>(fifo: &'a mut FifoReader<'_>) -> Option<RefOrBox<'a, dyn FifoCmd>> {
-    let cmd: u32 = fifo.next()?;
+pub fn fetch_fifo_cmd<'a>(view: &'a mut FifoView) -> Option<RefOrBox<'a, dyn FifoCmd>> {
+    let opcode = view.next()?;
 
-    match cmd {
-        FifoCmdUpdate::OPCODE => FifoCmdUpdate::from_fifo(fifo),
-        FifoCmdFence::OPCODE => FifoCmdFence::from_fifo(fifo),
+    match opcode {
+        FifoCmdUpdate::OPCODE => FifoCmdUpdate::from_fifo(view),
+        FifoCmdFence::OPCODE => FifoCmdFence::from_fifo(view),
         _ => {
-            panic!("unknown FIFO command: {cmd}");
+            panic!("unknown FIFO command: {opcode}");
         }
     }
 }

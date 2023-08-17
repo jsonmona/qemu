@@ -61,7 +61,7 @@ impl<T: Copy + Pod> SharedMem<T> {
 
     pub fn slice_to(&self, begin: usize, end: usize) -> &[T] {
         assert!(begin <= end, "inverted range");
-        assert!(end * size_of::<T>() < self.len, "buffer overflow");
+        assert!(end * size_of::<T>() <= self.len, "buffer overflow");
         let len = end - begin;
         let p = self.ptr as *mut T;
         unsafe { &*slice_from_raw_parts(p.add(begin), len) }

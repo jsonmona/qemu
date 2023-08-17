@@ -88,17 +88,17 @@ impl FifoState {
     }
 
     pub fn run(&self, width: u32, height: u32) {
-        let mut suspend = || self.suspend();
-        let mut fifo = FifoReader::new(self.fifo.clone(), &mut suspend);
-
+        let mut fifo = FifoReader::new(self.fifo.clone());
         let mut graphic = pollster::block_on(GraphicState::new(width, height));
 
         while self.enabled.load(Acquire) {
             self.render_output(width, height, &mut graphic);
 
-            let cmd = match fetch_fifo_cmd(&mut fifo) {
+            let mut view = fifo.view();
+            let cmd = match fetch_fifo_cmd(&mut view) {
                 Some(x) => x,
                 None => {
+                    self.suspend();
                     continue;
                 }
             };
